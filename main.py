@@ -722,10 +722,13 @@ if __name__ == "__main__":
             ngpu = len(str(lightning_config.trainer.gpus).strip(",").split(','))
         elif hasattr(lightning_config.trainer, "devices"):
             devices = lightning_config.trainer.devices
-            if isinstance(devices, (list, tuple)):
-                ngpu = len(devices)
+            if isinstance(devices, str):
+                ngpu = len([d for d in devices.split(",") if d])
             else:
-                ngpu = int(devices)
+                try:
+                    ngpu = len(devices)
+                except TypeError:
+                    ngpu = int(devices)
         else:
             ngpu = 1
     else:
