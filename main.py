@@ -530,10 +530,10 @@ if __name__ == "__main__":
             gpuinfo = trainer_config.pop("gpus")
             if isinstance(gpuinfo, str):
                 gpu_list = [int(x) for x in gpuinfo.split(",") if x]
-                # Lightning expects an int for a single GPU
-                trainer_config["devices"] = gpu_list[0] if len(gpu_list) == 1 else gpu_list
+                # Lightning expects a list of indices
+                trainer_config["devices"] = gpu_list if len(gpu_list) > 1 else [gpu_list[0]]
             else:
-                trainer_config["devices"] = gpuinfo
+                trainer_config["devices"] = list(gpuinfo) if isinstance(gpuinfo, (list, tuple)) else [int(gpuinfo)]
             trainer_config.setdefault("strategy", "ddp")
             trainer_config["accelerator"] = "gpu"
             print(f"Running on GPUs {gpuinfo}")
