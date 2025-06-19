@@ -1,4 +1,4 @@
-import argparse, os, sys, datetime, glob, importlib, csv
+import argparse, os, sys, datetime, glob, importlib, csv, inspect
 import numpy as np
 import time
 import torch
@@ -14,7 +14,7 @@ from PIL import Image
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
-from pytorch_lightning.utilities.distributed import rank_zero_only
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
@@ -140,9 +140,21 @@ def get_parser(**parser_kwargs):
 
 def nondefault_trainer_args(opt):
     parser = argparse.ArgumentParser()
-    parser = Trainer.add_argparse_args(parser)
-    args = parser.parse_args([])
-    return sorted(k for k in vars(args) if getattr(opt, k) != getattr(args, k))
+    defaults = {}
+    if hasattr(Trainer, "add_argparse_args"):
+        parser = Trainer.add_argparse_args(parser)
+        args = parser.parse_args([])
+        defaults = vars(args)
+    else:
+        sig = inspect.signature(Trainer.__init__)
+        for name, param in sig.parameters.items():
+            if name == "self":
+                continue
+            if param.default is not inspect._empty:
+                defaults[name] = param.default
+    return sorted(
+        k for k, v in defaults.items() if hasattr(opt, k) and getattr(opt, k) != v
+    )
 
 
 class WrappedDataset(Dataset):
@@ -309,9 +321,11 @@ class ImageLogger(Callback):
         self.rescale = rescale
         self.batch_freq = batch_frequency
         self.max_images = max_images
-        self.logger_log_images = {
-            pl.loggers.TestTubeLogger: self._testtube,
-        }
+        self.logger_log_images = {}
+        if hasattr(pl.loggers, "TestTubeLogger"):
+            self.logger_log_images[pl.loggers.TestTubeLogger] = self._testtube
+        if hasattr(pl.loggers, "TensorBoardLogger"):
+            self.logger_log_images[pl.loggers.TensorBoardLogger] = self._testtube
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
             self.log_steps = [self.batch_freq]
@@ -411,18 +425,34 @@ class CUDACallback(Callback):
     # see https://github.com/SeanNaren/minGPT/blob/master/mingpt/callback.py
     def on_train_epoch_start(self, trainer, pl_module):
         # Reset the memory use counter
-        torch.cuda.reset_peak_memory_stats(trainer.root_gpu)
-        torch.cuda.synchronize(trainer.root_gpu)
+        if hasattr(trainer, "root_gpu"):
+            device_index = trainer.root_gpu
+        elif getattr(trainer, "strategy", None) is not None:
+            device_index = trainer.strategy.root_device.index
+        else:
+            device_index = 0
+        torch.cuda.reset_peak_memory_stats(device_index)
+        torch.cuda.synchronize(device_index)
         self.start_time = time.time()
 
     def on_train_epoch_end(self, trainer, pl_module, outputs):
-        torch.cuda.synchronize(trainer.root_gpu)
-        max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
+        if hasattr(trainer, "root_gpu"):
+            device_index = trainer.root_gpu
+        elif getattr(trainer, "strategy", None) is not None:
+            device_index = trainer.strategy.root_device.index
+        else:
+            device_index = 0
+        torch.cuda.synchronize(device_index)
+        max_memory = torch.cuda.max_memory_allocated(device_index) / 2 ** 20
         epoch_time = time.time() - self.start_time
 
         try:
-            max_memory = trainer.training_type_plugin.reduce(max_memory)
-            epoch_time = trainer.training_type_plugin.reduce(epoch_time)
+            if hasattr(trainer, "training_type_plugin"):
+                max_memory = trainer.training_type_plugin.reduce(max_memory)
+                epoch_time = trainer.training_type_plugin.reduce(epoch_time)
+            elif hasattr(trainer, "strategy"):
+                max_memory = trainer.strategy.reduce(max_memory)
+                epoch_time = trainer.strategy.reduce(epoch_time)
 
             rank_zero_info(f"Average Epoch time: {epoch_time:.2f} seconds")
             rank_zero_info(f"Average Peak memory {max_memory:.2f}MiB")
@@ -436,7 +466,8 @@ if __name__ == "__main__":
     sys.path.append(os.getcwd())
 
     parser = get_parser()
-    parser = Trainer.add_argparse_args(parser)
+    if hasattr(Trainer, "add_argparse_args"):
+        parser = Trainer.add_argparse_args(parser)
 
     opt, unknown = parser.parse_known_args()
     if opt.name and opt.resume:
@@ -488,17 +519,37 @@ if __name__ == "__main__":
     lightning_config = config.pop("lightning", OmegaConf.create())
     # merge trainer cli with config
     trainer_config = lightning_config.get("trainer", OmegaConf.create())
-    # default to ddp
-    trainer_config["accelerator"] = "ddp"
+    pl_version = version.parse(pl.__version__)
+    use_new_accelerator = pl_version >= version.parse("1.7.0")
+
     for k in nondefault_trainer_args(opt):
         trainer_config[k] = getattr(opt, k)
-    if not "gpus" in trainer_config:
-        del trainer_config["accelerator"]
-        cpu = True
+
+    if use_new_accelerator:
+        if "gpus" in trainer_config:
+            gpuinfo = trainer_config.pop("gpus")
+            if isinstance(gpuinfo, str):
+                gpu_list = [int(x) for x in gpuinfo.split(",") if x]
+                # Lightning expects a list of indices
+                trainer_config["devices"] = gpu_list if len(gpu_list) > 1 else [gpu_list[0]]
+            else:
+                trainer_config["devices"] = list(gpuinfo) if isinstance(gpuinfo, (list, tuple)) else [int(gpuinfo)]
+            trainer_config.setdefault("strategy", "ddp")
+            trainer_config["accelerator"] = "gpu"
+            print(f"Running on GPUs {gpuinfo}")
+            cpu = False
+        else:
+            trainer_config["accelerator"] = "cpu"
+            cpu = True
     else:
-        gpuinfo = trainer_config["gpus"]
-        print(f"Running on GPUs {gpuinfo}")
-        cpu = False
+        trainer_config["accelerator"] = "ddp"
+        if not "gpus" in trainer_config:
+            del trainer_config["accelerator"]
+            cpu = True
+        else:
+            gpuinfo = trainer_config["gpus"]
+            print(f"Running on GPUs {gpuinfo}")
+            cpu = False
     trainer_opt = argparse.Namespace(**trainer_config)
     lightning_config.trainer = trainer_config
 
@@ -528,14 +579,23 @@ if __name__ == "__main__":
                 "id": nowname,
             }
         },
-        "testtube": {
+    }
+    if hasattr(pl.loggers, "TestTubeLogger"):
+        default_logger_cfgs["testtube"] = {
             "target": "pytorch_lightning.loggers.TestTubeLogger",
             "params": {
                 "name": "testtube",
                 "save_dir": logdir,
             }
-        },
-    }
+        }
+    else:
+        default_logger_cfgs["testtube"] = {
+            "target": "pytorch_lightning.loggers.TensorBoardLogger",
+            "params": {
+                "name": "tensorboard",
+                "save_dir": logdir,
+            }
+        }
     default_logger_cfg = default_logger_cfgs["testtube"]
     if "logger" in lightning_config:
         logger_cfg = lightning_config.logger
@@ -636,7 +696,11 @@ if __name__ == "__main__":
 
     trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
 
-    trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
+    if hasattr(Trainer, "from_argparse_args"):
+        trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
+    else:
+        trainer_kwargs.update(vars(trainer_opt))
+        trainer = Trainer(**trainer_kwargs)
     # trainer.plugins = [MyCluster()]
     trainer.logdir = logdir  ###
 
@@ -654,7 +718,19 @@ if __name__ == "__main__":
     # configure learning rate
     bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
     if not cpu:
-        ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+        if hasattr(lightning_config.trainer, "gpus"):
+            ngpu = len(str(lightning_config.trainer.gpus).strip(",").split(','))
+        elif hasattr(lightning_config.trainer, "devices"):
+            devices = lightning_config.trainer.devices
+            if isinstance(devices, str):
+                ngpu = len([d for d in devices.split(",") if d])
+            else:
+                try:
+                    ngpu = len(devices)
+                except TypeError:
+                    ngpu = int(devices)
+        else:
+            ngpu = 1
     else:
         ngpu = 1
     if 'accumulate_grad_batches' in lightning_config.trainer:
