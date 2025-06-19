@@ -511,10 +511,15 @@ if __name__ == "__main__":
 
     if use_new_accelerator:
         if "gpus" in trainer_config:
-            trainer_config["devices"] = trainer_config.pop("gpus")
+            gpuinfo = trainer_config.pop("gpus")
+            if isinstance(gpuinfo, str):
+                gpu_list = [int(x) for x in gpuinfo.split(",") if x]
+                # Lightning expects an int for a single GPU
+                trainer_config["devices"] = gpu_list[0] if len(gpu_list) == 1 else gpu_list
+            else:
+                trainer_config["devices"] = gpuinfo
             trainer_config.setdefault("strategy", "ddp")
             trainer_config["accelerator"] = "gpu"
-            gpuinfo = trainer_config["devices"]
             print(f"Running on GPUs {gpuinfo}")
             cpu = False
         else:
@@ -700,7 +705,11 @@ if __name__ == "__main__":
         if hasattr(lightning_config.trainer, "gpus"):
             ngpu = len(str(lightning_config.trainer.gpus).strip(",").split(','))
         elif hasattr(lightning_config.trainer, "devices"):
-            ngpu = len(str(lightning_config.trainer.devices).strip(",").split(','))
+            devices = lightning_config.trainer.devices
+            if isinstance(devices, (list, tuple)):
+                ngpu = len(devices)
+            else:
+                ngpu = int(devices)
         else:
             ngpu = 1
     else:
