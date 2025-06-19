@@ -1,4 +1,4 @@
-import argparse, os, sys, datetime, glob, importlib, csv
+import argparse, os, sys, datetime, glob, importlib, csv, inspect
 import numpy as np
 import time
 import torch
@@ -140,9 +140,21 @@ def get_parser(**parser_kwargs):
 
 def nondefault_trainer_args(opt):
     parser = argparse.ArgumentParser()
-    parser = Trainer.add_argparse_args(parser)
-    args = parser.parse_args([])
-    return sorted(k for k in vars(args) if getattr(opt, k) != getattr(args, k))
+    defaults = {}
+    if hasattr(Trainer, "add_argparse_args"):
+        parser = Trainer.add_argparse_args(parser)
+        args = parser.parse_args([])
+        defaults = vars(args)
+    else:
+        sig = inspect.signature(Trainer.__init__)
+        for name, param in sig.parameters.items():
+            if name == "self":
+                continue
+            if param.default is not inspect._empty:
+                defaults[name] = param.default
+    return sorted(
+        k for k, v in defaults.items() if hasattr(opt, k) and getattr(opt, k) != v
+    )
 
 
 class WrappedDataset(Dataset):
@@ -436,7 +448,8 @@ if __name__ == "__main__":
     sys.path.append(os.getcwd())
 
     parser = get_parser()
-    parser = Trainer.add_argparse_args(parser)
+    if hasattr(Trainer, "add_argparse_args"):
+        parser = Trainer.add_argparse_args(parser)
 
     opt, unknown = parser.parse_known_args()
     if opt.name and opt.resume:
