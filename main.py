@@ -488,17 +488,32 @@ if __name__ == "__main__":
     lightning_config = config.pop("lightning", OmegaConf.create())
     # merge trainer cli with config
     trainer_config = lightning_config.get("trainer", OmegaConf.create())
-    # default to ddp
-    trainer_config["accelerator"] = "ddp"
+    pl_version = version.parse(pl.__version__)
+    use_new_accelerator = pl_version >= version.parse("1.7.0")
+
     for k in nondefault_trainer_args(opt):
         trainer_config[k] = getattr(opt, k)
-    if not "gpus" in trainer_config:
-        del trainer_config["accelerator"]
-        cpu = True
+
+    if use_new_accelerator:
+        if "gpus" in trainer_config:
+            trainer_config["devices"] = trainer_config.pop("gpus")
+            trainer_config.setdefault("strategy", "ddp")
+            trainer_config["accelerator"] = "gpu"
+            gpuinfo = trainer_config["devices"]
+            print(f"Running on GPUs {gpuinfo}")
+            cpu = False
+        else:
+            trainer_config["accelerator"] = "cpu"
+            cpu = True
     else:
-        gpuinfo = trainer_config["gpus"]
-        print(f"Running on GPUs {gpuinfo}")
-        cpu = False
+        trainer_config["accelerator"] = "ddp"
+        if not "gpus" in trainer_config:
+            del trainer_config["accelerator"]
+            cpu = True
+        else:
+            gpuinfo = trainer_config["gpus"]
+            print(f"Running on GPUs {gpuinfo}")
+            cpu = False
     trainer_opt = argparse.Namespace(**trainer_config)
     lightning_config.trainer = trainer_config
 
@@ -654,7 +669,12 @@ if __name__ == "__main__":
     # configure learning rate
     bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
     if not cpu:
-        ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+        if hasattr(lightning_config.trainer, "gpus"):
+            ngpu = len(str(lightning_config.trainer.gpus).strip(",").split(','))
+        elif hasattr(lightning_config.trainer, "devices"):
+            ngpu = len(str(lightning_config.trainer.devices).strip(",").split(','))
+        else:
+            ngpu = 1
     else:
         ngpu = 1
     if 'accumulate_grad_batches' in lightning_config.trainer:
