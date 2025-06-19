@@ -675,7 +675,11 @@ if __name__ == "__main__":
 
     trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
 
-    trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
+    if hasattr(Trainer, "from_argparse_args"):
+        trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
+    else:
+        trainer_kwargs.update(vars(trainer_opt))
+        trainer = Trainer(**trainer_kwargs)
     # trainer.plugins = [MyCluster()]
     trainer.logdir = logdir  ###
 
